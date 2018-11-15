@@ -1,0 +1,304 @@
+import keras
+import os
+import collections
+import copy
+import math
+import numpy as np
+import tensorflow as tf
+import random as rn
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from itertools import groupby
+from keras import *
+from keras.layers import *
+from keras.models import *
+from keras.callbacks import *
+from keras import backend as K
+from keras.preprocessing.text import Tokenizer
+from keras.preprocessing.sequence import pad_sequences
+
+# recurrent
+os.environ['PYTHONHASHSEED'] = '0'
+np.random.seed(42)
+rn.seed(12345)
+session_conf = tf.ConfigProto(intra_op_parallelism_threads=1, inter_op_parallelism_threads=1)
+tf.set_random_seed(1234)
+sess = tf.Session(graph=tf.get_default_graph(), config=session_conf)
+K.set_session(sess)
+
+# parameter
+dim = 256
+dropout = 0.0
+maxlen = 32
+batch_size = 1024
+epochs = 1000
+
+# read data
+questions, answers, a_id = [], [], []
+
+f = open('/home/yzhou/STC3/data/questions.txt','r',encoding='gbk')
+lines = f.readlines()
+for line in lines:
+    line = line.strip()
+    questions.append(line)
+f.close()
+
+f = open('/home/yzhou/STC3/data/answers.txt','r',encoding='gbk')
+lines = f.readlines()
+for line in lines:
+    line = line.strip()
+    answers.append(line)
+f.close()
+
+f = open('/home/yzhou/STC3/data/answers_id.txt','r',encoding='gbk')
+lines = f.readlines()
+for line in lines:
+    line = line.strip()
+    a_id.append(line)
+f.close()
+
+print(len(questions),len(answers),len(a_id))
+
+# judging chinese
+def check_contain_chinese(check_str):
+    for ch in check_str:
+        if u'\u4e00' <= ch <= u'\u9fff':
+            return True
+    return False
+
+# delete non-Chinese
+i = 0
+while 1:
+    j = len(questions)
+    if i >= j:
+        break
+    if check_contain_chinese(questions[i]) and check_contain_chinese(answers[i]):
+        i += 1
+    else:
+        questions.pop(i)
+        answers.pop(i)
+        a_id.pop(i)
+
+print(len(questions),len(answers),len(a_id))
+
+# standardization
+def pre_process(text):
+    for j in range(len(text)):
+        
+        # expression
+        text[j] = text[j].replace('[ [', '[').replace('] ]', ']')
+        zuo, you = 0, 0
+        g = len(text[j])-1
+        while 1:
+            if text[j][g] ==  ']':
+                you = g
+            elif text[j][g] == '[':
+                zuo = g
+                for h in range(you,zuo,-1):
+                    if text[j][h] == ' ':
+                        you -= 1
+                        text[j] = text[j][:h] + text[j][h+1:]
+            if g == 0:
+                break
+            else:
+                g -= 1
+
+        # duplicate words
+        text[j] = text[j].split(' ')
+        text[j] = [x[0] for x in groupby(text[j])]
+        for index, string in enumerate(text[j]):
+            if len(string) > 3:
+                char_list = list(string)
+                for i in range(len(string)-3):
+                    if char_list[len(string)-1-i] == char_list[len(string)-2-i] and char_list[len(string)-1-i] == char_list[len(string)-3-i] and char_list[len(string)-1-i] == char_list[len(string)-4-i]:
+                        char_list.pop(len(string)-1-i)
+                text[j][index] = "".join(char_list)
+        g = 0
+        while 1:
+            if text[j][g] == '':
+                text[j].pop(g)
+            else:
+                g += 1
+            if g > len(text[j])-1:
+                break
+        
+        temp = ''.join(text[j])
+        text[j] = list(temp)
+    return text
+
+# standardization
+questions = pre_process(questions)
+answers = pre_process(answers)
+print(len(questions),len(answers),len(a_id))
+
+# initial dictionary
+char_ques,char_answ = [],[]
+for i in range(len(questions)):
+    for j in range(len(questions[i])):
+        char_ques.append(questions[i][j])
+        
+for i in range(len(answers)):
+    for j in range(len(answers[i])):
+        char_answ.append(answers[i][j])
+        
+ques_dict = collections.Counter(char_ques)
+answ_dict = collections.Counter(char_answ)
+print(len(ques_dict),len(ques_dict))
+
+# word frequency
+rest_ques = dict(filter(lambda x: (x[1] > 50 and (x[0] >= '\u4e00' and x[0] <= '\u9fff')) or (x[1] > 250 and (x[0] < '\u4e00' or x[0] > '\u9fff')), ques_dict.items()))
+print('问词典数：',len(rest_ques))
+
+rest_answ = dict(filter(lambda x: (x[1] > 250 and (x[0] >= '\u4e00' and x[0] <= '\u9fff')) or (x[1] > 500 and (x[0] < '\u4e00' or x[0] > '\u9fff')), answ_dict.items()))
+print('答词典数：',len(rest_answ))
+
+# Reconstructed corpus
+train_ques,train_answ = [],[]
+for i in tqdm(range(len(questions))):
+    temp_ques, temp_answ = '','<开始> '
+    for j in range(len(questions[i])):
+        if questions[i][j] in rest_answ.keys():
+            temp_ques += questions[i][j]
+            if j != len(questions[i])-1:
+                temp_ques += ' '
+        else:
+            temp_ques += '<未知>'
+            if j != len(questions[i])-1:
+                temp_ques += ' '
+    train_ques.append(temp_ques)
+    for j in range(len(answers[i])):
+        if answers[i][j] in rest_answ.keys():
+            temp_answ += answers[i][j]
+        else:
+            temp_answ += '<未知>'
+        temp_answ += ' '
+    temp_answ += '<结束>'
+    train_answ.append(temp_answ)
+
+# serialization
+tokenizer = Tokenizer(filters='')
+tokenizer.fit_on_texts(train_ques+train_answ)
+ques_text = tokenizer.texts_to_sequences(train_ques)
+answ_text = tokenizer.texts_to_sequences(train_answ)
+
+dic = tokenizer.word_index
+dic['<填充>'] = 0  #'<填充>': 0, '<开始>': 1, '<结束>': 2, '<未知>': 21
+ind ={value:key for key, value in dic.items()}
+
+# data for train and valid
+input_ques,input_answ,input_label,output_word,temp_ques,temp_label = [],[],[],[],[],[]
+temp_ques = pad_sequences(ques_text, maxlen=maxlen, truncating='post')
+for i in range(len(a_id)):
+    temp_id = np.ones(maxlen, dtype='int32') * int(a_id[i])
+    temp_label.append(temp_id)
+for i in tqdm(range(len(answ_text))):
+    temp_answ = []
+    for j in range(maxlen):
+            temp_answ.append(0)
+    for j in range(maxlen):
+        temp_answ.pop(0)
+        temp_answ.append(answ_text[i][j])
+        temp = copy.deepcopy(temp_answ)
+        input_answ.append(temp)
+        output_word.append(answ_text[i][j+1])
+        input_ques.append(temp_ques[i])
+        input_label.append(temp_label[i])
+        if answ_text[i][j+1] == 2:
+            break
+input_ques = np.asarray(input_ques)
+input_answ = np.asarray(input_answ)
+input_label = np.asarray(input_label)
+output_word = np.asarray(np.expand_dims(output_word, axis=-1))
+
+# beam
+def gen_resp(post,emotion,topk=5):
+    test_post = pre_process([post])[0]
+    for i in range(len(test_post)):
+        if test_post[i] in dic.keys():
+            test_post[i] = dic[test_post[i]]
+        else:
+            test_post[i] = dic['<未知>']
+    test_post = pad_sequences([test_post], maxlen=maxlen, truncating='post')[0]
+    test_post = np.array([test_post] * topk)
+
+    test_emot = np.ones(maxlen, dtype=int) * int(emotion)
+    test_emot = np.array([test_emot] * topk)
+
+    temp_resp = []
+    for j in range(maxlen):
+        temp_resp.append(0)
+    temp = 1
+    temp_resp.pop(0)
+    temp_resp.append(temp)
+    test_resp = np.array([np.asarray(temp_resp)] * topk)
+    scores = [0] * topk
+    n_score = []
+    for i in range(maxlen):
+        proba = model.predict([np.asarray(test_post),np.asarray(test_resp),np.asarray(test_emot)])
+        char_pred = np.argsort(proba)[:,-topk:]
+        temp_resp = test_resp.tolist()
+        if i == 0:
+            for j in range(topk):
+                temp_resp[j].pop(0)
+                temp_resp[j].append(char_pred[j][-1-j])
+                n_score.append(proba[0][char_pred[j][-1-j]])
+                test_resp = np.asarray(temp_resp)
+        else:
+            nn_score,tt_resp = [],[]
+            for j in range(topk):
+                for k in range(topk):
+                    nn_score.append(n_score[j]+proba[j][char_pred[j][-1-k]])
+                    tt_resp.append(char_pred[j][-1-k])
+            nn_pred = np.argsort(nn_score)[-topk:]
+            for j in range(topk):
+                k = nn_pred[-1-j] // topk
+                tempt_resp = test_resp.tolist()
+                tempt_resp[k].pop(0)
+                tempt_resp[k].append(tt_resp[nn_pred[-1-j]])
+                temp_resp[j] = copy.deepcopy(tempt_resp[k])
+                n_score[j] = nn_score[nn_pred[-1-j]]
+            test_resp = np.asarray(temp_resp)
+    test_resp = test_resp[0].tolist()
+    for i in range(len(test_resp)):
+        test_resp[i] = ind[test_resp[i]]
+        if test_resp[i] == '<结束>':
+            break
+    text_pred = ''.join(test_resp[0:i+1])
+    return text_pred.lstrip('<填充>').lstrip('<开始>').rstrip('<结束>')
+
+dim = 256
+# model
+lab = 'model_bb0'
+embed = Embedding(len(dic), dim
+                 )
+input_post = Input(shape=(None,), name='input_post')
+x = embed(input_post)
+x = BatchNormalization()(x)
+x = Bidirectional(LSTM(dim, return_sequences=True, dropout=dropout))(x)
+
+input_resp = Input(shape=(None,), name='input_resp')
+y = embed(input_resp)
+y = BatchNormalization()(y)
+y = LSTM(dim, return_sequences=True, dropout=dropout)(y)
+
+input_emot = Input(shape=(None,), name='input_emot')
+z = Embedding(6, dim)(input_emot)
+
+xyz = concatenate([x, y, z], name='merge_resp')
+xyz = BatchNormalization()(xyz)
+xyz = Bidirectional(LSTM(dim, return_sequences=False, dropout=dropout), name='blstm_resp')(xyz)
+outpt_resp = Dense(len(dic), activation='softmax', name='outpt_resp')(xyz)
+model = Model(inputs=[input_post, input_resp, input_emot], outputs=outpt_resp)
+model.summary()
+
+# compile
+model.compile(loss='sparse_categorical_crossentropy', optimizer=optimizers.Adam(), metrics=[metrics.sparse_categorical_accuracy])
+
+# callback
+filepath = '/home/yzhou/STC3/weight/' + lab + '.hdf5'
+checkpoint = ModelCheckpoint(filepath, verbose=1, save_best_only=True, mode='min')
+plateau = ReduceLROnPlateau(factor=0.1, patience=2, verbose=1, min_lr=0.00002)
+stop = EarlyStopping(patience=5, verbose=1)
+callbacks_list = [checkpoint,plateau,stop]
+
+history = model.fit(x=[input_ques,input_answ,input_label], y=output_word, batch_size=batch_size, epochs=epochs, validation_split=0.1, callbacks=callbacks_list)
