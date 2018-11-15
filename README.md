@@ -1,0 +1,2 @@
+# CECG
+CECG of STC-3 Task in NTCIR-14
